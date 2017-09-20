@@ -90,6 +90,41 @@
 #if defined(_WIN32)
 # include <windows.h>
 # include <winioctl.h>
+
+//  REPARSE_DATA_BUFFER related definitions are found in ntifs.h,
+//  which is part of the Device Driver Kit rather than the SDK.
+//  See https://msdn.microsoft.com/en-us/library/windows/hardware/ff552012(v=vs.85).aspx
+
+typedef struct _REPARSE_DATA_BUFFER {
+  ULONG  ReparseTag;
+  USHORT ReparseDataLength;
+  USHORT Reserved;
+  union {
+    struct {
+      USHORT SubstituteNameOffset;
+      USHORT SubstituteNameLength;
+      USHORT PrintNameOffset;
+      USHORT PrintNameLength;
+      ULONG  Flags;
+      WCHAR  PathBuffer[1];
+    } SymbolicLinkReparseBuffer;
+    struct {
+      USHORT SubstituteNameOffset;
+      USHORT SubstituteNameLength;
+      USHORT PrintNameOffset;
+      USHORT PrintNameLength;
+      WCHAR  PathBuffer[1];
+    } MountPointReparseBuffer;
+    struct {
+      UCHAR DataBuffer[1];
+    } GenericReparseBuffer;
+  };
+} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
+
+#define REPARSE_DATA_BUFFER_HEADER_SIZE  FIELD_OFFSET(REPARSE_DATA_BUFFER, GenericReparseBuffer)
+
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE  ( 16 * 1024 )
+
 # ifndef INVALID_FILE_ATTRIBUTES
 #  define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
 # endif
@@ -3378,27 +3413,59 @@ bool SystemTools::FileIsSymlink(const std::string& name)
 #endif
 }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-bool SystemTools::CreateSymlink(const std::string&, const std::string&)
-{
-  return false;
-}
-#else
+
 bool SystemTools::CreateSymlink(const std::string& origName, const std::string& newName)
 {
-  return symlink(origName.c_str(), newName.c_str()) >= 0;
-}
-#endif
-
 #if defined(_WIN32) && !defined(__CYGWIN__)
-bool SystemTools::ReadSymlink(const std::string&, std::string&)
-{
-  return false;
-}
+
+  // Old windows.h headers do not provide CreateSymbolicLink.
+  typedef BOOL(WINAPI *CreateSymbolicLinkType)(LPTSTR, LPTSTR, DWORD);
+  static CreateSymbolicLinkType pCreateSymbolicLink =
+    (CreateSymbolicLinkType)GetProcAddress(GetModuleHandleW(L"kernel32"),
+    "CreateSymbolicLinkA");
+  if (pCreateSymbolicLink && pCreateSymbolicLink((LPTSTR)newName.c_str(), (LPTSTR)origName.c_str(), 0))
+    {
+    return true;
+    }
+  else
+    {
+    return false;
+    }
 #else
-bool SystemTools::ReadSymlink(const std::string& newName,
-                              std::string& origName)
+    return symlink(origName.c_str(), newName.c_str()) >= 0;
+#endif
+}
+
+bool SystemTools::ReadSymlink(const std::string& newName, // input symlink
+                              std::string& origName) // output real file name
 {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+  HANDLE handle = CreateFileW(Encoding::ToWide(newName).c_str(), GENERIC_READ,
+    FILE_SHARE_READ /*| FILE_SHARE_WRITE | FILE_SHARE_DELETE*/, NULL, OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  if (handle == INVALID_HANDLE_VALUE)
+    {
+    return false;
+    }
+  std::vector<BYTE> buffer(MAXIMUM_REPARSE_DATA_BUFFER_SIZE, 0);
+  REPARSE_DATA_BUFFER *reparse_buffer = (REPARSE_DATA_BUFFER*)&buffer[0];
+  DWORD sentinel = 0;
+  bool success = false;
+  if (DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0, reparse_buffer,
+    MAXIMUM_REPARSE_DATA_BUFFER_SIZE, &sentinel, NULL))
+    {
+    if (reparse_buffer->ReparseTag == IO_REPARSE_TAG_SYMLINK)
+      {
+      wchar_t* startOffset = (wchar_t*)reparse_buffer->SymbolicLinkReparseBuffer.PathBuffer + reparse_buffer->SymbolicLinkReparseBuffer.PrintNameOffset / sizeof(wchar_t);
+      wchar_t* endOffset =   startOffset + reparse_buffer->SymbolicLinkReparseBuffer.PrintNameLength / sizeof(wchar_t);
+      std::wstring substituteName(startOffset, endOffset);
+      origName = kwsys::Encoding::ToNarrow(substituteName);
+      success = true;
+      }
+    }
+  CloseHandle(handle);
+  return success;
+#else
   char buf[KWSYS_SYSTEMTOOLS_MAXPATH+1];
   int count =
     static_cast<int>(readlink(newName.c_str(), buf, KWSYS_SYSTEMTOOLS_MAXPATH));
@@ -3413,8 +3480,8 @@ bool SystemTools::ReadSymlink(const std::string& newName,
     {
     return false;
     }
-}
 #endif
+}
 
 int SystemTools::ChangeDirectory(const std::string& dir)
 {
